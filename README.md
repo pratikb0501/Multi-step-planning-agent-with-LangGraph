@@ -139,6 +139,56 @@ Each node reads what it needs and writes its results back. Nodes don't call each
 
 ---
 
+## Checkpointing — Crash Recovery
+
+The agent persists state after every node using LangGraph's `SqliteSaver`. If the process crashes mid-execution, it resumes from the last completed step instead of starting over.
+
+```mermaid
+flowchart TD
+    A[Node 1 executes] --> B[Checkpoint saved<br/>to checkpoints.db]
+    B --> C[Node 2 executes]
+    C --> D[Checkpoint saved]
+    D --> E[Node 3 — CRASH]
+    E --> F[Resume with same thread_id]
+    F --> G[Load last checkpoint<br/>steps 1-2 preserved]
+    G --> H[Continue from step 3<br/>no wasted work]
+
+    style B fill:#fff3cd,stroke:#b8860b
+    style D fill:#fff3cd,stroke:#b8860b
+    style E fill:#fde8e8,stroke:#c0392b
+    style G fill:#eafaf1,stroke:#1e8449
+```
+
+### Tested proof
+
+```
+FIRST RUN: crashed mid-step-3 (killed process during a web search)
+  → steps 1 and 2 completed and saved
+
+RESUME RUN: python resume.py (same thread_id)
+  → "Steps completed so far: 2"
+  → "Findings so far: ['1', '2']"
+  → restarted ONLY step 3 — steps 1-2 were not redone
+  → continued through steps 4, 5, and synthesized the final report
+```
+
+No wasted API calls, no wasted web searches — only the interrupted step re-runs.
+
+### How it works
+
+```python
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+with SqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
+    app = graph.compile(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": "session-1"}}
+    result = app.invoke(initial_state, config=config)
+```
+
+Every `thread_id` is an isolated "save slot" — multiple users or sessions never mix state. Resuming is as simple as calling `app.invoke(None, config=config)` with the same `thread_id`.
+
+---
+
 ## Failure handling
 
 The agent handles failures at two levels:
@@ -188,6 +238,7 @@ flowchart LR
 | Component | Choice |
 |-----------|--------|
 | Orchestration | LangGraph (StateGraph, conditional edges) |
+| Persistence | langgraph-checkpoint-sqlite (crash recovery) |
 | LLM | qwen2.5:7b (Ollama, local) |
 | Web search | ddgs (DuckDuckGo, no API key) |
 | State | TypedDict shared across nodes |
@@ -200,7 +251,7 @@ Runs **fully local and free**.
 
 ```bash
 ollama pull qwen2.5:7b
-pip install langgraph langchain-ollama ddgs
+pip install langgraph langchain-ollama ddgs langgraph-checkpoint-sqlite
 python agent.py
 ```
 
@@ -210,7 +261,9 @@ python agent.py
 
 ```
 .
-├── agent.py         # the full planning agent
+├── agent.py           # the full planning agent with checkpointing
+├── resume.py          # resumes an interrupted run from the last checkpoint
+├── checkpoints.db      # SQLite checkpoint store (gitignored)
 └── README.md
 ```
 
@@ -248,5 +301,6 @@ The architecture is correct — latency is a deployment optimization, not a desi
 - Progressive context building — each step receives findings from all previous steps
 - Graceful degradation — synthesize partial results when steps fail rather than crashing
 - The latency cost of multi-step agents and production strategies to mitigate it
+- Checkpointing with SqliteSaver and thread_id for crash recovery — tested by killing the process mid-run and confirming it resumed from the last completed step without redoing work
 
 Built as part of a self-directed AI engineering track — progressing from single-step agents to planned, multi-step orchestration.

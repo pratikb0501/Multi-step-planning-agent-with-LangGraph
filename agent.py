@@ -2,6 +2,7 @@ from typing import TypedDict, List, Dict
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
 from ddgs import DDGS
+from langgraph.checkpoint.sqlite import SqliteSaver
 import json
 
 llm = ChatOllama(model="qwen2.5:7b")
@@ -194,27 +195,31 @@ graph.add_conditional_edges("execute", should_continue, {
 })
 graph.add_edge("synthesize", END)
 
-# compile
-app = graph.compile()
+
 
 
 
 if __name__ == "__main__":
-    goal = input("What is your research goal? ")
-    print(f"\nGoal: {goal}\n")
+    # compile
+    with SqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
+        app = graph.compile(checkpointer=checkpointer)
 
-    result = app.invoke({
-        "goal": goal,
-        "plan": [],
-        "current_step_index": 0,
-        "findings": {},
-        "failed_steps": [],
-        "final_report": ""
-    })
+        goal = input("What is your research goal? ")
+        print(f"\nGoal: {goal}\n")
 
-    print("\n" + "="*50)
-    print("FINAL REPORT")
-    print("="*50)
-    print(result["final_report"])
-    print(f"\nCompleted steps: {len(result['completed_steps']) if 'completed_steps' in result else 'N/A'}")
-    print(f"Failed steps: {result['failed_steps']}")
+        config = {"configurable": {"thread_id": "session-1"}}
+
+        result = app.invoke({
+            "goal": goal,
+            "plan": [],
+            "current_step_index": 0,
+            "findings": {},
+            "failed_steps": [],
+            "final_report": ""
+        }, config=config)
+
+        print("\n" + "="*50)
+        print("FINAL REPORT")
+        print("="*50)
+        print(result["final_report"])
+        print(f"\nFailed steps: {result['failed_steps']}")
