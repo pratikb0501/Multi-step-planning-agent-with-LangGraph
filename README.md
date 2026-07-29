@@ -4,6 +4,10 @@ A multi-step research agent that **breaks complex goals into sub-tasks**, execut
 
 Unlike a single-step agent that answers in one shot, this agent **plans ahead** — decomposing a goal into ordered steps, executing each while building on previous findings, and combining everything into a coherent answer.
 
+The agent has **two modes**:
+- **Sequential planning** — steps execute one after another, each building on previous findings, with checkpointing for crash recovery
+- **Parallel research** — independent items (e.g. comparing 3 companies) are researched simultaneously using fan-out/fan-in
+
 ---
 
 ## What it does
@@ -202,6 +206,118 @@ The agent produces a **partial result** rather than crashing — useful informat
 
 ---
 
+## Parallel Execution — Fan-out / Fan-in
+
+For goals that require researching multiple independent items (e.g. comparing 3 companies), the agent can fan out to research each one simultaneously instead of sequentially, using LangGraph's `Send()` mechanism.
+
+```mermaid
+flowchart TD
+    A[PREPARE<br/>extract list of items] --> B{ROUTE<br/>fan out via Send}
+    B --> C[research_one<br/>item A]
+    B --> D[research_one<br/>item B]
+    B --> E[research_one<br/>item C]
+    C --> F[COMBINE<br/>fan in]
+    D --> F
+    E --> F
+    F --> G[END]
+
+    style A fill:#fff3cd,stroke:#b8860b
+    style B fill:#fff3cd,stroke:#b8860b
+    style C fill:#e8f4fd,stroke:#2e75b6
+    style D fill:#e8f4fd,stroke:#2e75b6
+    style E fill:#e8f4fd,stroke:#2e75b6
+    style F fill:#eafaf1,stroke:#1e8449
+```
+
+### How `Send()` works
+
+A routing function returns a list of `Send()` objects instead of a single node name — each one triggers a separate execution of the target node with different input:
+
+```python
+def route_to_parallel_research(state: AgentState):
+    companies = state.get("companies_to_research", [])
+    return [Send("research_one", {"company": c}) for c in companies]
+```
+
+Three companies → three parallel executions of `research_one`, each researching a different company.
+
+### The reducer problem
+
+When multiple parallel branches write to the same state key, the default behavior is **last write wins** — earlier results get silently overwritten:
+
+```
+WITHOUT a reducer:
+  branch 1 writes: findings = {"OpenAI": "..."}
+  branch 2 writes: findings = {"Google": "..."}    ← overwrites branch 1
+  branch 3 writes: findings = {"Anthropic": "..."} ← overwrites branch 2
+  FINAL: only Anthropic's data survives — OpenAI and Google LOST
+```
+
+The fix is a **reducer** — a function that tells LangGraph how to merge simultaneous writes instead of overwriting:
+
+```python
+from typing import Annotated
+import operator
+
+class AgentState(TypedDict):
+    parallel_findings: Annotated[Dict, operator.or_]  # merges dicts instead of overwriting
+```
+
+```
+WITH the reducer (operator.or_):
+  branch 1 writes: {"OpenAI": "..."}
+  branch 2 writes: {"Google": "..."}
+  branch 3 writes: {"Anthropic": "..."}
+  LangGraph merges all three: {"OpenAI": "...", "Google": "...", "Anthropic": "..."}
+  FINAL: all three preserved ✅
+```
+
+### An honest infrastructure limitation
+
+Testing this locally against Ollama revealed an important distinction: **code-level parallelism does not guarantee infrastructure-level parallelism.**
+
+```
+LangGraph dispatched 6 parallel branches correctly (architecture is right)
+Ollama processed them ONE AT A TIME — a single local model instance serializes requests
+Result: 232 seconds total, no faster than sequential execution
+```
+
+This isn't a bug in the graph — it's a constraint of running a single local LLM server. On a cloud API that supports concurrent requests, the same graph would realize the actual speed benefit of parallel execution. The lesson: **parallel code only helps if the underlying infrastructure can actually execute requests concurrently.**
+
+### Extraction prompt tightening
+
+The first version of the extraction prompt hallucinated products instead of extracting the companies actually named in the goal:
+
+```
+GOAL: "compare the main products of OpenAI, Google DeepMind, and Anthropic"
+
+WEAK PROMPT → ['ChatGPT', 'Language Model', 'AlphaFold', 'Inception', 'LaMDA', 'Claude']
+   6 items, wrong types (products not companies), some hallucinated entirely
+
+TIGHTENED PROMPT → ['OpenAI', 'Google DeepMind', 'Anthropic']
+   exactly 3 items, exactly the companies named in the goal
+```
+
+The fix required no code logic changes — only prompt engineering:
+
+```python
+response = llm.invoke(
+    f"Read this goal and extract ONLY the specific company or product names "
+    f"that are EXPLICITLY MENTIONED by name. Do not infer, guess, or add "
+    f"any names that are not directly stated in the goal.\n\n"
+    f"Goal: {goal}\n\n"
+    f"Return ONLY a JSON array of the exact names mentioned. "
+    f"If 3 companies are named, return exactly 3 items — no more, no less.\n\n"
+    f"Example:\n"
+    f'Goal: "compare OpenAI, Google, and Anthropic"\n'
+    f'Output: ["OpenAI", "Google", "Anthropic"]'
+)
+```
+
+Three changes made the difference: explicit "do not infer" instruction, a hard count constraint, and a one-shot example matching the exact use case — all techniques from prompt engineering fundamentals (Week 1).
+
+---
+
 ## The evolution from simple to multi-step
 
 ```mermaid
@@ -255,13 +371,29 @@ pip install langgraph langchain-ollama ddgs langgraph-checkpoint-sqlite
 python agent.py
 ```
 
+## Usage
+
+The agent prompts for a mode on startup:
+
+```
+Mode — (1) sequential planning or (2) parallel research? 1
+What is your goal? what are the main products of Anthropic?
+```
+
+```
+Mode — (1) sequential planning or (2) parallel research? 2
+What is your goal? compare the main products of OpenAI, Google DeepMind, and Anthropic
+```
+
+Use sequential mode for goals with dependent steps (research → compare → recommend). Use parallel mode when comparing independent items that don't depend on each other's results.
+
 ---
 
 ## Project structure
 
 ```
 .
-├── agent.py           # the full planning agent with checkpointing
+├── agent.py           # sequential planning agent + parallel fan-out/fan-in graph
 ├── resume.py          # resumes an interrupted run from the last checkpoint
 ├── checkpoints.db      # SQLite checkpoint store (gitignored)
 └── README.md
@@ -302,5 +434,8 @@ The architecture is correct — latency is a deployment optimization, not a desi
 - Graceful degradation — synthesize partial results when steps fail rather than crashing
 - The latency cost of multi-step agents and production strategies to mitigate it
 - Checkpointing with SqliteSaver and thread_id for crash recovery — tested by killing the process mid-run and confirming it resumed from the last completed step without redoing work
+- Fan-out/fan-in parallel execution using LangGraph's Send() mechanism
+- Why reducers (operator.or_) are required for parallel writes to shared state — without one, simultaneous branch results silently overwrite each other
+- The difference between code-level parallelism and infrastructure-level parallelism — a correctly parallel graph is still bottlenecked by a single-instance local LLM server that serializes requests
 
 Built as part of a self-directed AI engineering track — progressing from single-step agents to planned, multi-step orchestration.

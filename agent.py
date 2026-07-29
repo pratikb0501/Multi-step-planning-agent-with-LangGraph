@@ -1,9 +1,12 @@
-from typing import TypedDict, List, Dict
+from typing import TypedDict, List, Dict,Annotated
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
+from langgraph.types import Send
 from ddgs import DDGS
 from langgraph.checkpoint.sqlite import SqliteSaver
 import json
+import operator
+
 
 llm = ChatOllama(model="qwen2.5:7b")
 
@@ -14,6 +17,8 @@ class AgentState(TypedDict):
     findings:            Dict       # results from each step
     failed_steps:        List[str]  # steps that failed
     final_report:        str        # the synthesized answer
+    companies_to_research: List[str]
+    parallel_findings:   Annotated[Dict, operator.or_]  # merges parallel results
 
 
 def plan_node(state: AgentState) -> dict:
@@ -177,49 +182,132 @@ def synthesize_node(state: AgentState) -> dict:
 
     return {"final_report": response.content}
 
+def route_to_parallel_research(state: AgentState):
+    # Fan out
+    companies = state.get("companies_to_research", [])
+    return [Send("research_one", {"company": c, "goal": state["goal"]}) for c in companies]
 
-# build the graph
-graph = StateGraph(AgentState)
+def research_one_node(state: dict) -> dict:
+    # Research a single company 
+    company = state["company"]
+    print(f"\n  [Parallel] Researching: {company}")
+    
+    result = web_search(f"{company} main products 2026")
+    summary_response = llm.invoke(
+        f"Summarize {company}'s main products in 2-3 sentences based on:\n{result}"
+    )
+    
+    return {"parallel_findings": {company: summary_response.content.strip()}}
 
-# add nodes
-graph.add_node("plan", plan_node)
-graph.add_node("execute", execute_node)
-graph.add_node("synthesize", synthesize_node)
 
-# add edges
-graph.set_entry_point("plan")
-graph.add_edge("plan", "execute")
-graph.add_conditional_edges("execute", should_continue, {
+def prepare_parallel_node(state: AgentState) -> dict:
+    """Ask the LLM to extract the list of items to research in parallel"""
+    goal = state["goal"]
+    response = llm.invoke(
+        f"Read this goal and extract ONLY the specific company or product names "
+        f"that are EXPLICITLY MENTIONED by name. Do not infer, guess, or add "
+        f"any names that are not directly stated in the goal.\n\n"
+        f"Goal: {goal}\n\n"
+        f"Return ONLY a JSON array of the exact names mentioned. "
+        f"If 3 companies are named, return exactly 3 items — no more, no less.\n\n"
+        f"Example:\n"
+        f'Goal: "compare OpenAI, Google, and Anthropic"\n'
+        f'Output: ["OpenAI", "Google", "Anthropic"]'
+    )
+    raw = response.content.strip().replace("```json", "").replace("```", "").strip()
+    try:
+        companies = json.loads(raw)
+    except json.JSONDecodeError:
+        companies = []
+    
+    print(f"\n  Items to research in parallel: {companies}")
+    return {"companies_to_research": companies}
+
+
+def combine_parallel_node(state: AgentState) -> dict:
+    """Combine all parallel findings into a final report"""
+    findings = state.get("parallel_findings", {})
+    goal = state["goal"]
+    
+    findings_text = "\n\n".join([f"{k}: {v}" for k, v in findings.items()])
+    
+    response = llm.invoke(
+        f"Goal: {goal}\n\nFindings:\n{findings_text}\n\n"
+        f"Write a structured comparison report."
+    )
+    return {"final_report": response.content}
+
+
+# build the PARALLEL graph
+parallel_graph = StateGraph(AgentState)
+parallel_graph.add_node("prepare", prepare_parallel_node)
+parallel_graph.add_node("research_one", research_one_node)
+parallel_graph.add_node("combine", combine_parallel_node)
+
+parallel_graph.set_entry_point("prepare")
+parallel_graph.add_conditional_edges("prepare", route_to_parallel_research, ["research_one"])
+parallel_graph.add_edge("research_one", "combine")
+parallel_graph.add_edge("combine", END)
+
+parallel_app = parallel_graph.compile()
+
+
+sequential_graph = StateGraph(AgentState)
+sequential_graph.add_node("plan", plan_node)
+sequential_graph.add_node("execute", execute_node)
+sequential_graph.add_node("synthesize", synthesize_node)
+
+sequential_graph.set_entry_point("plan")
+sequential_graph.add_edge("plan", "execute")
+sequential_graph.add_conditional_edges("execute", should_continue, {
     "execute": "execute",
     "synthesize": "synthesize"
 })
-graph.add_edge("synthesize", END)
-
-
-
-
+sequential_graph.add_edge("synthesize", END)
 
 if __name__ == "__main__":
-    # compile
-    with SqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
-        app = graph.compile(checkpointer=checkpointer)
+    import time
 
-        goal = input("What is your research goal? ")
-        print(f"\nGoal: {goal}\n")
+    mode = input("Mode — (1) sequential planning or (2) parallel research? ")
+    goal = input("What is your goal? ")
 
-        config = {"configurable": {"thread_id": "session-1"}}
+    
 
-        result = app.invoke({
+    if mode == "1":
+        with SqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
+            app = sequential_graph.compile(checkpointer=checkpointer)
+            config = {"configurable": {"thread_id": "session-1"}}
+
+            result = app.invoke({
+                "goal": goal,
+                "plan": [],
+                "current_step_index": 0,
+                "findings": {},
+                "failed_steps": [],
+                "final_report": ""
+            }, config=config)
+
+            print("\n" + "="*50)
+            print("FINAL REPORT")
+            print("="*50)
+            print(result["final_report"])
+            print(f"\nFailed steps: {result['failed_steps']}")
+
+    else:
+        start = time.time()
+        result = parallel_app.invoke({
             "goal": goal,
             "plan": [],
             "current_step_index": 0,
             "findings": {},
             "failed_steps": [],
-            "final_report": ""
-        }, config=config)
+            "final_report": "",
+            "companies_to_research": [],
+            "parallel_findings": {}
+        })
+        elapsed = time.time() - start
 
-        print("\n" + "="*50)
-        print("FINAL REPORT")
-        print("="*50)
+        print(f"\n{'='*50}")
+        print(f"COMPLETED IN {elapsed:.1f} SECONDS")
+        print(f"{'='*50}")
         print(result["final_report"])
-        print(f"\nFailed steps: {result['failed_steps']}")
